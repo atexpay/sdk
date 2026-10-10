@@ -2,56 +2,55 @@
  * AtexPay JavaScript SDK — worked examples (Node.js 18+, server-side only).
  */
 
-import { AtexPay, verifyWebhook } from './atexpay.js';
+import { AtexPay, ProductExistsError, verifyWebhook } from './atexpay.js';
 
 const atexpay = new AtexPay(process.env.ATEXPAY_API_KEY);
 
 // ── 1. Smoke test the key ────────────────────────────────────────────────
 const pong = await atexpay.ping();
-console.log(`Connected as ${pong.merchant}`);
+console.log(`Connected as ${pong.seller}`);
 
-// ── 2. Create a payment link and show it to the buyer ────────────────────
-const link = await atexpay.createPaymentLink({
+// ── 2. Add a product and share its checkout page ─────────────────────────
+const brandAudit = {
     name: 'Brand audit',
-    description: 'Full brand review with a written report.',
+    description: 'Full brand review with a written report, delivered as a PDF.',
+    category: 'marketing',
+    delivery_type: 'downloadable',
     price_minor: 145000, // $1,450.00
-    single_use: true,
     return_url: 'https://your-site.example/thanks',
-});
-console.log(`Pay at: ${link.url}`);
+};
 
-// ── 3. Or: send a logged-in customer straight to a prefilled checkout ────
-// Their email arrives prefilled and hidden; name and address arrive
-// prefilled but editable. Nothing readable appears in the URL.
-const url = await atexpay.createCheckoutUrl(
-    {
-        name: 'Brand audit',
-        price_minor: 145000,
-        single_use: true,
-        return_url: 'https://your-site.example/thanks',
-    },
-    {
-        email: 'customer@example.com',
-        name: 'Jordan Buyer',
-        address: {
-            country: 'US',
-            line1: '123 Main St',
-            city: 'Any Town',
-            state: 'CA',
-            postal_code: '12345',
-        },
-    },
-);
+let product;
+try {
+    product = await atexpay.createProduct(brandAudit);
+} catch (error) {
+    if (!(error instanceof ProductExistsError)) throw error;
+    // Titles are unique per seller: reuse the product you already have.
+    product = await atexpay.product(error.productId);
+}
+console.log(`Buy at: ${product.checkout_url}`);
+
+// ── 3. Change it later — wording, price, or take it off sale ─────────────
+await atexpay.updateProduct(product.id, { price_minor: 155000 });
+
+// ── 4. Or: send a logged-in customer straight to a prefilled checkout ────
+// Reuses the product with this title. Their email arrives prefilled and
+// hidden; name and address arrive prefilled but editable.
+const url = await atexpay.createCheckoutUrl(brandAudit, {
+    email: 'customer@example.com',
+    name: 'Jordan Buyer',
+    address: { country: 'US', line1: '123 Main St', city: 'Any Town', state: 'CA', postal_code: '12345' },
+});
 // In Express: res.redirect(url)
 console.log(`Prefilled checkout: ${url}`);
 
-// ── 4. Webhook endpoint (Express) ────────────────────────────────────────
+// ── 5. Webhook endpoint (Express) ────────────────────────────────────────
 // Register the URL in Settings → Developers and store the atxwh_ secret.
 /*
 import express from 'express';
 const app = express();
 
-app.post('/webhooks/atexpay', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhooks/atexpay', express.raw({ type: 'application/json' }), async (req, res) => {
     let event;
     try {
         event = verifyWebhook(req.body, req.headers, process.env.ATEXPAY_WEBHOOK_SECRET);
@@ -62,11 +61,13 @@ app.post('/webhooks/atexpay', express.raw({ type: 'application/json' }), (req, r
     res.sendStatus(200); // respond fast, process after
 
     if (event.type === 'payment.succeeded') {
-        // fulfil the order for event.data.id — gross/fee/net are final here.
         // Deduplicate on event.id — retries reuse the same event id.
+        const orderId = event.data.order_id; // the order to deliver
+        // ... prepare the files, then:
+        await atexpay.deliverOrder(orderId, { delivery_note: 'Your report is attached.' }, ['/path/to/report.pdf']);
     }
 });
 */
 
-// ── 5. Query a transaction later ─────────────────────────────────────────
-// const txn = await atexpay.transaction('txn_XXXXXXXXXXXX');
+// ── 6. Orders waiting for you ────────────────────────────────────────────
+// for (const order of await atexpay.orders('in_progress')) console.log(order.id);

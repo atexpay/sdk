@@ -1,26 +1,32 @@
 /**
- * AtexPay JavaScript SDK — a single-file client for the AtexPay merchant API.
+ * AtexPay JavaScript SDK — a single-file client for the AtexPay products and
+ * orders API.
  *
- * Version 1.0.0 · Node.js 18+ (uses global fetch and node:crypto) · ESM · no
- * dependencies. Server-side only: never ship your API key or webhook signing
- * secret to a browser.
+ * Version 2.0.0 · Node.js 18+ (uses global fetch, FormData and node:crypto) ·
+ * ESM · no dependencies. Server-side only: never ship your API key or webhook
+ * signing secret to a browser.
  *
  *     import { AtexPay } from './atexpay.js';
  *
  *     const atexpay = new AtexPay(process.env.ATEXPAY_API_KEY);
- *     const link = await atexpay.createPaymentLink({
+ *     const product = await atexpay.createProduct({
  *       name: 'Brand audit',
+ *       description: 'A written review of your brand, delivered as a PDF.',
+ *       category: 'marketing',
+ *       delivery_type: 'downloadable',
  *       price_minor: 145000, // $1,450.00 in cents
  *       return_url: 'https://your-site.example/thanks',
  *     });
- *     // Send the buyer to link.url — or use createCheckoutUrl().
+ *     // Send the buyer to product.checkout_url — or use createCheckoutUrl().
  *
  * Full API reference: https://atexpay.com/docs/
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 
-export const VERSION = '1.0.0';
+export const VERSION = '2.0.0';
 
 /** Base error for every failed API call. */
 export class AtexPayError extends Error {
@@ -28,12 +34,23 @@ export class AtexPayError extends Error {
      * @param {string} message
      * @param {number} [status] HTTP status, 0 when the API was unreachable
      * @param {Record<string, string[]>} [errors] field => messages on validation failures
+     * @param {string | null} [type] the API's error type, e.g. "product_exists"
      */
-    constructor(message, status = 0, errors = {}) {
+    constructor(message, status = 0, errors = {}, type = null) {
         super(message);
         this.name = 'AtexPayError';
         this.status = status;
         this.errors = errors;
+        this.type = type;
+    }
+}
+
+/** A product with this title already exists (HTTP 409); `productId` is the existing one. */
+export class ProductExistsError extends AtexPayError {
+    constructor(message, productId) {
+        super(message, 409, {}, 'product_exists');
+        this.name = 'ProductExistsError';
+        this.productId = productId;
     }
 }
 
@@ -55,61 +72,125 @@ export class AtexPay {
         this.baseUrl = baseUrl.replace(/\/+$/, '');
     }
 
-    /** Confirms the key works. Resolves to {ok, merchant, time}. */
+    /** Confirms the key works. Resolves to {ok, seller, time}. */
     ping() {
         return this.#request('GET', '/ping');
     }
 
     /**
-     * Create a payment link. `name` and `price_minor` (cents) are required;
-     * optional: description, buyer_email, single_use, return_url (https —
-     * where the buyer is sent after paying, with ?status=success&link=…).
-     * Resolves to the link object; its `url` is the page for buyers.
+     * Create a product; its `checkout_url` is the page for buyers. Required:
+     * name, description, category, delivery_type ('downloadable' | 'service')
+     * and price_minor (cents). Optional: buyer_email (a custom order) and
+     * return_url (https — the buyer comes back with ?status=success&product=…).
+     *
+     * Rejects with ProductExistsError when the title is already taken.
      *
      * @param {object} params
      */
-    createPaymentLink(params) {
-        return this.#request('POST', '/payment-links', params);
+    createProduct(params) {
+        return this.#request('POST', '/products', params);
     }
 
-    /** The 100 most recent payment links. */
-    paymentLinks() {
-        return this.#request('GET', '/payment-links');
+    /** The 100 most recent products. */
+    products() {
+        return this.#request('GET', '/products');
+    }
+
+    /** One product by its prod_ id. */
+    product(id) {
+        return this.#request('GET', `/products/${encodeURIComponent(id)}`);
+    }
+
+    /**
+     * Change a product: any of name, description, category, delivery_type,
+     * price_minor, status ('active' | 'paused'), buyer_email, return_url.
+     * Orders already placed keep what was bought.
+     *
+     * @param {string} id
+     * @param {object} changes
+     */
+    updateProduct(id, changes) {
+        return this.#request('PATCH', `/products/${encodeURIComponent(id)}`, changes);
     }
 
     /**
      * Mint a checkout URL carrying the buyer's details as an opaque,
      * expiring token — nothing readable or alterable in the URL. On the
-     * payment page the email arrives prefilled and hidden; name and address
+     * checkout page the email arrives prefilled and hidden; name and address
      * arrive prefilled but stay editable.
      *
-     * @param {string} linkId the link_ id
+     * @param {string} productId the prod_ id
      * @param {{email?: string, name?: string, address?: {country?: string, line1?: string, line2?: string, city?: string, state?: string, postal_code?: string}}} customer at least one field
      * @returns {Promise<{url: string, expires_at: string}>} valid for 24 hours
      */
-    createCheckoutSession(linkId, customer) {
-        return this.#request('POST', `/payment-links/${encodeURIComponent(linkId)}/checkout-sessions`, customer);
+    createCheckoutSession(productId, customer) {
+        return this.#request('POST', `/products/${encodeURIComponent(productId)}/checkout-sessions`, customer);
     }
 
     /**
-     * One call from product page to payment page: creates the link and, when
-     * customer details are given, a prefilled checkout URL for this buyer.
-     * Resolves to the URL to redirect the buyer to (e.g. res.redirect(url)).
+     * One call from your product page to checkout: uses the product with this
+     * title (creating it the first time) and, when customer details are
+     * given, a prefilled checkout URL for this buyer. Resolves to the URL to
+     * redirect the buyer to (e.g. res.redirect(url)).
      *
-     * @param {object} linkParams as createPaymentLink
+     * @param {object} productParams as createProduct
      * @param {object} [customer] as createCheckoutSession
      * @returns {Promise<string>}
      */
-    async createCheckoutUrl(linkParams, customer = null) {
-        const link = await this.createPaymentLink(linkParams);
+    async createCheckoutUrl(productParams, customer = null) {
+        let product;
 
-        if (!customer || Object.keys(customer).length === 0) {
-            return link.url;
+        try {
+            product = await this.createProduct(productParams);
+        } catch (error) {
+            if (!(error instanceof ProductExistsError)) throw error;
+            product = await this.product(error.productId);
         }
 
-        const session = await this.createCheckoutSession(link.id, customer);
+        if (!customer || Object.keys(customer).length === 0) {
+            return product.checkout_url;
+        }
+
+        const session = await this.createCheckoutSession(product.id, customer);
 
         return session.url;
+    }
+
+    /**
+     * The 100 most recent orders, optionally of one status.
+     *
+     * @param {'in_progress' | 'delivered' | 'completed' | 'canceled'} [status]
+     */
+    orders(status) {
+        return this.#request('GET', '/orders' + (status ? `?status=${encodeURIComponent(status)}` : ''));
+    }
+
+    /** One order by its ord_ id, with its delivery timeline. */
+    order(id) {
+        return this.#request('GET', `/orders/${encodeURIComponent(id)}`);
+    }
+
+    /**
+     * Deliver an in-progress order: files (local paths) and/or a delivery_url,
+     * plus an optional delivery_note. The buyer is emailed a link to collect
+     * it; the order completes when they download or open it.
+     *
+     * @param {string} id
+     * @param {{delivery_note?: string, delivery_url?: string}} delivery
+     * @param {string[]} [files] local file paths
+     */
+    async deliverOrder(id, delivery, files = []) {
+        const form = new FormData();
+
+        for (const [key, value] of Object.entries(delivery ?? {})) {
+            if (value !== undefined && value !== null && value !== '') form.append(key, String(value));
+        }
+
+        for (const path of files) {
+            form.append('files[]', new Blob([await readFile(path)]), basename(path));
+        }
+
+        return this.#request('POST', `/orders/${encodeURIComponent(id)}/deliver`, form);
     }
 
     /** The 100 most recent transactions (newest first). */
@@ -119,9 +200,9 @@ export class AtexPay {
 
     /**
      * Full detail for one transaction by its txn_ id — the same shape your
-     * webhook endpoint receives in the event's `data` object. Use this (or
-     * the webhook) as the source of truth before fulfilling; never the
-     * buyer's return redirect.
+     * webhook endpoint receives in the event's `data` object, with its
+     * product_id and order_id. Use this (or the webhook) as the source of
+     * truth before fulfilling; never the buyer's return redirect.
      *
      * @param {string} id
      */
@@ -139,9 +220,10 @@ export class AtexPay {
                     authorization: `Bearer ${this.apiKey}`,
                     accept: 'application/json',
                     'user-agent': `atexpay-js/${VERSION}`,
-                    ...(body ? { 'content-type': 'application/json' } : {}),
+                    // FormData sets its own multipart boundary.
+                    ...(body && !(body instanceof FormData) ? { 'content-type': 'application/json' } : {}),
                 },
-                body: body ? JSON.stringify(body) : undefined,
+                body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
             });
         } catch (cause) {
             throw new AtexPayError(`Could not reach the AtexPay API: ${cause.message}`);
@@ -155,7 +237,11 @@ export class AtexPay {
 
         const message = json?.error?.message ?? json?.message ?? `AtexPay API error (HTTP ${response.status}).`;
 
-        throw new AtexPayError(message, response.status, json?.errors ?? {});
+        if (response.status === 409 && json?.error?.type === 'product_exists') {
+            throw new ProductExistsError(message, json.error.product_id);
+        }
+
+        throw new AtexPayError(message, response.status, json?.errors ?? {}, json?.error?.type ?? null);
     }
 }
 
@@ -174,7 +260,7 @@ export class AtexPay {
  *       const event = verifyWebhook(req.body, req.headers, process.env.ATEXPAY_WEBHOOK_SECRET);
  *       res.sendStatus(200); // respond fast, process after
  *       if (event.type === 'payment.succeeded') {
- *         // fulfil the order for event.data.id — gross/fee/net are final here.
+ *         // event.data.order_id is the order to deliver — gross/fee/net are final here.
  *         // Deduplicate on event.id — retries reuse the same event id.
  *       }
  *     });

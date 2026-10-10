@@ -13,27 +13,33 @@ $atexpay = new \AtexPay\Client(getenv('ATEXPAY_API_KEY'));
 
 // ── 1. Smoke test the key ────────────────────────────────────────────────
 $pong = $atexpay->ping();
-echo "Connected as {$pong['merchant']}\n";
+echo "Connected as {$pong['seller']}\n";
 
-// ── 2. Create a payment link and show it to the buyer ────────────────────
-$link = $atexpay->createPaymentLink([
+// ── 2. Add a product and share its checkout page ─────────────────────────
+$brandAudit = [
     'name' => 'Brand audit',
-    'description' => 'Full brand review with a written report.',
+    'description' => 'Full brand review with a written report, delivered as a PDF.',
+    'category' => 'marketing',
+    'delivery_type' => 'downloadable',
     'price_minor' => 145000,                     // $1,450.00
-    'single_use' => true,
     'return_url' => 'https://your-site.example/thanks',
-]);
-echo "Pay at: {$link['url']}\n";
+];
 
-// ── 3. Or: send a logged-in customer straight to a prefilled checkout ────
-// Their email arrives prefilled and hidden; name and address arrive
-// prefilled but editable. Nothing readable appears in the URL.
-$atexpay->redirectToCheckout([
-    'name' => 'Brand audit',
-    'price_minor' => 145000,
-    'single_use' => true,
-    'return_url' => 'https://your-site.example/thanks',
-], [
+try {
+    $product = $atexpay->createProduct($brandAudit);
+} catch (\AtexPay\ProductExistsException $e) {
+    // Titles are unique per seller: reuse the product you already have.
+    $product = $atexpay->product($e->productId);
+}
+echo "Buy at: {$product['checkout_url']}\n";
+
+// ── 3. Change it later — wording, price, or take it off sale ─────────────
+$atexpay->updateProduct($product['id'], ['price_minor' => 155000]);
+
+// ── 4. Or: send a logged-in customer straight to a prefilled checkout ────
+// Reuses the product with this title. Their email arrives prefilled and
+// hidden; name and address arrive prefilled but editable.
+$atexpay->redirectToCheckout($brandAudit, [
     'email' => 'customer@example.com',
     'name' => 'Jordan Buyer',
     'address' => [
@@ -45,7 +51,7 @@ $atexpay->redirectToCheckout([
     ],
 ]);
 
-// ── 4. Webhook endpoint (its own route/file) ─────────────────────────────
+// ── 5. Webhook endpoint (its own route/file) ─────────────────────────────
 // Register the URL in Settings → Developers and store the atxwh_ secret.
 /*
 $event = \AtexPay\Webhook::verify(
@@ -59,10 +65,11 @@ $event = \AtexPay\Webhook::verify(
 http_response_code(200);
 
 if ($event['type'] === 'payment.succeeded') {
-    $txn = $event['data'];
-    // fulfil the order for $txn['id'] — gross/fee/net are final here
+    $orderId = $event['data']['order_id'];   // the order to deliver
+    // ... prepare the files, then:
+    $atexpay->deliverOrder($orderId, ['delivery_note' => 'Your report is attached.'], ['/path/to/report.pdf']);
 }
 */
 
-// ── 5. Query a transaction later ─────────────────────────────────────────
-// $txn = $atexpay->transaction('txn_XXXXXXXXXXXX');
+// ── 6. Orders waiting for you ────────────────────────────────────────────
+// foreach ($atexpay->orders('in_progress') as $order) { echo $order['id'], "\n"; }
